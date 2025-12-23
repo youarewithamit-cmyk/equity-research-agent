@@ -3,6 +3,7 @@ import google.generativeai as genai
 from tavily import TavilyClient
 import yfinance as yf
 import pandas as pd
+import tabulate # Needed for markdown
 
 # --- PAGE CONFIG ---
 st.set_page_config(
@@ -12,14 +13,31 @@ st.set_page_config(
 )
 
 st.title("📈 Agentic Equity Research Assistant")
-st.markdown("Generates a professional Investment Report using **Live Financials** (Yahoo Finance) + **Web Search** (Tavily).")
 
-# --- STEP 1: SMART AUTHENTICATION ---
+# --- 1. TICKER LIST (The Dropdown Source) ---
+@st.cache_data # Cache this so it doesn't reload on every click
+def get_nifty500_tickers():
+    # You can replace this list with a full CSV load later!
+    # Common NIFTY 500 Stocks
+    tickers = [
+        "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "ITC", "BHARTIARTL",
+        "SBIN", "LICI", "HINDUNILVR", "TATAMOTORS", "LT", "BAJFINANCE", "HCLTECH",
+        "MARUTI", "SUNPHARMA", "ADANIENT", "TITAN", "KOTAKBANK", "ONGC", "TATASTEEL",
+        "NTPC", "POWERGRID", "ASIANPAINT", "ULTRACEMCO", "AXISBANK", "WIPRO",
+        "BAJAJFINSV", "COALINDIA", "M&M", "ADANIPORTS", "JSWSTEEL", "TATASTEEL",
+        "DMART", "ZOMATO", "JIOFIN", "DLF", "VBL", "HAL", "BEL", "IRFC", "TRENT",
+        "SIEMENS", "INDIGO", "PIDILITIND", "GRASIM", "SBILIFE", "TECHM", "BRITANNIA",
+        "HINDALCO", "GODREJCP", "EICHERMOT", "LTIM", "DRREDDY", "CIPLA", "IOC",
+        "GAIL", "RECLTD", "PFC", "ADANIPOWER", "BANKBARODA", "TATAPOWER", "CHOLAFIN",
+        "AMBUJACEM", "CANBK", "VEDL", "INDUSINDBK", "HAVELLS", "TVSMOTOR", "HEROMOTOCO",
+        "DABUR", "SHREECEM", "MANKIND", "BAJAJ-AUTO", "ABB", "BPCL", "BOSCHLTD",
+        "CUMMINSIND", "DIVISLAB", "MUTHOOTFIN", "PIIND", "PAGEIND", "OFSS", "POLYCAB"
+    ]
+    # Sort alphabetically for easier searching
+    return sorted(tickers)
+
+# --- 2. AUTHENTICATION ---
 def load_api_keys():
-    """
-    Prioritizes Streamlit Secrets. Falls back to Sidebar Manual Input.
-    """
-    # 1. Try Loading from Secrets (Cloud / Local .streamlit/secrets.toml)
     try:
         g_key = st.secrets["GOOGLE_API_KEY"]
         t_key = st.secrets["TAVILY_API_KEY"]
@@ -27,189 +45,137 @@ def load_api_keys():
     except (FileNotFoundError, KeyError):
         pass
 
-    # 2. Fallback: Ask User in Sidebar
     with st.sidebar:
         st.header("🔐 Authentication")
-        st.caption("Enter keys to proceed (or add them to Secrets for auto-login).")
         g_input = st.text_input("Gemini API Key", type="password")
         t_input = st.text_input("Tavily API Key", type="password")
-        
         if not g_input or not t_input:
             return None, None, "⚠️ Waiting for Keys..."
-        
         return g_input, t_input, "✅ Authenticated via Sidebar"
 
-# Load Keys
 GOOGLE_API_KEY, TAVILY_API_KEY, status_msg = load_api_keys()
 
-# Display Status
 if "✅" in status_msg:
     st.success(status_msg)
 else:
     st.warning(status_msg)
-    st.stop() # Stop execution here until keys are provided
+    st.stop()
 
-# Configure Clients
 genai.configure(api_key=GOOGLE_API_KEY)
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
-# --- STEP 2: ROBUST MODEL SELECTOR ---
+# --- 3. MODEL & DATA ENGINES ---
 def get_working_model():
-    """
-    Finds a valid Gemini model for your API key to prevent 404 Errors.
-    """
     try:
         models = list(genai.list_models())
         valid_models = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-        
-        if not valid_models:
-            return None
-        
-        # Preference Order (Fastest -> Strongest)
-        preferences = [
-            'models/gemini-1.5-flash', 
-            'models/gemini-1.5-flash-latest',
-            'models/gemini-1.5-pro',
-            'models/gemini-pro'
-        ]
-        
+        if not valid_models: return None
+        preferences = ['models/gemini-1.5-flash', 'models/gemini-1.5-pro', 'models/gemini-pro']
         for p in preferences:
-            if p in valid_models:
-                return p
-        
-        return valid_models[0] # Fallback
-    except:
-        return None
+            if p in valid_models: return p
+        return valid_models[0]
+    except: return None
 
-# --- STEP 3: DATA ENGINES ---
 def get_financials(ticker):
-    """
-    Fetches 3-Year Financials from Yahoo Finance with Error Handling.
-    """
     try:
-        # 1. Clean Ticker
         t = ticker.upper().strip().replace(" ", "")
-        if not t.endswith(".NS"):
-            t += ".NS"
-            
+        if not t.endswith(".NS"): t += ".NS"
+        
         stock = yf.Ticker(t)
+        fin = stock.financials
+        bs = stock.balance_sheet
         
-        # 2. Fetch Data
-        try:
-            fin = stock.financials
-        except Exception:
-            return None, f"Could not connect to Yahoo Finance for {t}"
-            
-        if fin.empty:
-            return None, f"❌ No financial data found for '{t}'. Check if the ticker is correct."
+        if fin.empty: return None, f"❌ No data for {t}"
         
-        # 3. Process Data
         years = fin.columns[:3]
         data = {}
         for date in years:
             yr = date.strftime('%Y')
             try:
-                # Metrics
                 rev = fin.loc['Total Revenue', date] / 1e7
                 pat = fin.loc['Net Income', date] / 1e7
-                
-                # Equity (Handle missing BS data)
-                equity = 1
-                if not stock.balance_sheet.empty and 'Stockholders Equity' in stock.balance_sheet.index:
-                     if date in stock.balance_sheet.columns:
-                        equity = stock.balance_sheet.loc['Stockholders Equity', date]
-
-                roe = (pat * 1e7 / equity) * 100
+                equity = bs.loc['Stockholders Equity', date] if 'Stockholders Equity' in bs.index else 1
                 
                 data[yr] = {
-                    "Revenue(Cr)": round(rev, 0),
-                    "PAT(Cr)": round(pat, 0),
-                    "ROE %": round(roe, 1)
+                    "Rev(Cr)": round(rev,0), 
+                    "PAT(Cr)": round(pat,0), 
+                    "ROE%": round((pat*1e7/equity)*100, 1)
                 }
-            except:
-                continue
-
-        if not data:
-            return None, "❌ Data found but could not parse Revenue/Profit."
-
+            except: continue
+            
         return pd.DataFrame(data).to_markdown(), None
-
-    except Exception as e:
-        return None, f"Critical Error: {str(e)}"
+    except Exception as e: return None, str(e)
 
 def get_news(ticker):
-    """
-    Fetches news summaries from Tavily.
-    """
     try:
-        query = f"{ticker} share price news india frauds analysis"
-        results = tavily.search(query=query, max_results=3)
-        context = ""
-        for r in results['results']:
-            context += f"- {r['title']}: {r['content'][:250]}...\n"
-        return context
-    except Exception as e:
-        return f"News Error: {str(e)}"
+        # Tavily Search
+        results = tavily.search(query=f"{ticker} share news india frauds analysis", max_results=3)
+        return "\n".join([f"- {r['title']}: {r['content'][:250]}..." for r in results['results']])
+    except: return "News Error"
 
-# --- STEP 4: MAIN UI & EXECUTION ---
-ticker_input = st.text_input("Enter NSE Ticker Symbol (e.g. ZOMATO, RELIANCE, TCS):", "").upper()
-generate_btn = st.button("🚀 Generate Research Report")
+# --- 4. MAIN UI WITH DROPDOWN ---
 
+# A. Get the list of tickers
+ticker_list = get_nifty500_tickers()
+
+# B. Create a layout for the selector
+col1, col2 = st.columns([3, 1])
+
+with col1:
+    # THE SEARCHABLE DROPDOWN
+    selected_ticker = st.selectbox(
+        "Select a Company (Type to Search):", 
+        ticker_list,
+        index=None,  # Start with nothing selected
+        placeholder="Select stock..."
+    )
+
+with col2:
+    # Just a spacer to align the button
+    st.write("") 
+    st.write("")
+    generate_btn = st.button("🚀 Run Research", type="primary")
+
+# C. Execution Logic
 if generate_btn:
-    if not ticker_input:
-        st.error("Please enter a ticker symbol.")
+    if not selected_ticker:
+        st.error("Please select a ticker from the dropdown.")
     else:
-        # 1. Connection Check
-        with st.spinner("🔍 Connecting to AI Brain..."):
+        with st.spinner("🔍 Connecting to AI..."):
             model_name = get_working_model()
             
-        if not model_name:
-            st.error("❌ API Error: No working Gemini models found for your key.")
-        else:
-            # 2. Data Gathering
-            with st.spinner(f"📊 Gathering Financials & News for {ticker_input}..."):
-                fin_markdown, error_msg = get_financials(ticker_input)
-                news_text = get_news(ticker_input)
-                
-                if error_msg:
-                    st.error(error_msg)
-                else:
-                    # 3. Show Raw Data (Optional Transparency)
-                    with st.expander("View Source Data"):
-                        st.subheader("Financials")
-                        st.text(fin_markdown)
-                        st.subheader("News Context")
-                        st.text(news_text)
+            if not model_name:
+                st.error("❌ API Error: No working Gemini models found.")
+            else:
+                with st.spinner(f"📊 Analyzing {selected_ticker}..."):
+                    fin_markdown, error = get_financials(selected_ticker)
+                    news_text = get_news(selected_ticker)
                     
-                    # 4. AI Synthesis
-                    with st.spinner("✍️ Analyst is writing the report..."):
-                        prompt = f"""
-                        You are a Senior Equity Research Analyst.
-                        Write a professional investment report for **{ticker_input}**.
-                        
-                        [REAL DATA SOURCE]
-                        {fin_markdown}
-                        
-                        [NEWS SOURCE]
-                        {news_text}
-                        
-                        ---
-                        YOUR REPORT STRUCTURE:
-                        1. **Executive Summary**: What does the company do?
-                        2. **Financial Health Check**: Analyze the Revenue and ROE trends from the data above.
-                        3. **Risk Analysis**: Summarize any red flags or negative news found.
-                        4. **Investment Verdict**: Buy/Sell/Hold rating with specific rationale.
-                        
-                        Use clear Markdown formatting with bullet points.
-                        """
-                        
-                        try:
-                            model = genai.GenerativeModel(model_name)
-                            response = model.generate_content(prompt)
+                    if error:
+                        st.error(error)
+                    else:
+                        with st.spinner("✍️ Writing Final Report..."):
+                            prompt = f"""
+                            You are a Senior Analyst. Write a report for **{selected_ticker}**.
                             
-                            st.markdown("---")
-                            st.subheader(f"📝 Research Report: {ticker_input}")
-                            st.markdown(response.text)
+                            [DATA]
+                            {fin_markdown}
                             
-                        except Exception as e:
-                            st.error(f"AI Generation Failed: {str(e)}")
+                            [NEWS]
+                            {news_text}
+                            
+                            Output:
+                            1. Business Summary
+                            2. Financial Trend Analysis
+                            3. Risk Flags
+                            4. Investment Verdict (Buy/Sell/Hold)
+                            """
+                            
+                            try:
+                                model = genai.GenerativeModel(model_name)
+                                response = model.generate_content(prompt)
+                                st.markdown("---")
+                                st.subheader(f"📝 Report: {selected_ticker}")
+                                st.markdown(response.text)
+                            except Exception as e:
+                                st.error(f"AI Error: {e}")
