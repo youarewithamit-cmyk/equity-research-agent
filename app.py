@@ -6,7 +6,7 @@ import pandas as pd
 import time
 from tenacity import retry, stop_after_attempt, wait_fixed
 
-# --- PAGE CONFIG ---
+# --- PAGE CONFIGURATION ---
 st.set_page_config(
     page_title="AI Equity Researcher",
     page_icon="📈",
@@ -18,6 +18,9 @@ st.markdown("Generates a professional Investment Report using **Live Financials*
 
 # --- 1. AUTHENTICATION ---
 def load_api_keys():
+    """
+    Prioritizes Streamlit Secrets. Falls back to Sidebar Manual Input.
+    """
     try:
         g_key = st.secrets["GOOGLE_API_KEY"]
         t_key = st.secrets["TAVILY_API_KEY"]
@@ -40,7 +43,7 @@ if "✅" in status_msg:
     st.success(status_msg)
 else:
     st.warning(status_msg)
-    st.stop()
+    st.stop() # Stop execution until keys are present
 
 # Configure Clients
 genai.configure(api_key=GOOGLE_API_KEY)
@@ -48,15 +51,21 @@ tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
 # --- 2. DATA ENGINES ---
 def get_financials(ticker):
+    """
+    Fetches 3-Year Financials from Yahoo Finance with Error Handling.
+    """
     try:
+        # Smart Ticker Cleaning
         t = ticker.upper().strip().replace(" ", "")
-        if not t.endswith(".NS"): t += ".NS"
+        if not t.endswith(".NS"): 
+            t += ".NS"
         
         stock = yf.Ticker(t)
         fin = stock.financials
         bs = stock.balance_sheet
         
-        if fin.empty: return None, f"❌ No data for {t}"
+        if fin.empty: 
+            return None, f"❌ No data found for '{t}'. Check if the ticker is correct."
         
         years = fin.columns[:3]
         data = {}
@@ -72,21 +81,25 @@ def get_financials(ticker):
                     "PAT(Cr)": round(pat,0), 
                     "ROE%": round((pat*1e7/equity)*100, 1)
                 }
-            except: continue
+            except: 
+                continue
             
         return pd.DataFrame(data).to_markdown(), None
-    except Exception as e: return None, str(e)
+    except Exception as e: 
+        return None, str(e)
 
 def get_news(ticker):
+    """
+    Fetches news summaries from Tavily.
+    """
     try:
         results = tavily.search(query=f"{ticker} share news india frauds analysis", max_results=3)
         return "\n".join([f"- {r['title']}: {r['content'][:250]}..." for r in results['results']])
-    except: return "News Error"
+    except: 
+        return "News unavailable."
 
 # --- 3. ROBUST AI GENERATION ---
-# We force 'gemini-1.5-flash' because it has 1500 Requests Per Day (Free Tier)
-# vs 'gemini-2.5-flash' which has only 20.
-
+# Forced to use 'gemini-1.5-flash' (1500 RPD) to avoid '429 Quota' errors.
 def generate_report_safe(prompt):
     model = genai.GenerativeModel('gemini-1.5-flash')
     
@@ -108,34 +121,45 @@ def generate_report_safe(prompt):
             return f"Error: {e}"
 
 # --- 4. MAIN UI ---
-ticker_list = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ITC", "SBIN", "TATAMOTORS", "ZOMATO", "M&M"] 
+# Searchable Dropdown List
+ticker_list = [
+    "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "ITC", "BHARTIARTL",
+    "SBIN", "LICI", "HINDUNILVR", "TATAMOTORS", "LT", "BAJFINANCE", "HCLTECH",
+    "MARUTI", "SUNPHARMA", "ADANIENT", "TITAN", "KOTAKBANK", "ONGC", "TATASTEEL",
+    "NTPC", "POWERGRID", "ASIANPAINT", "ULTRACEMCO", "AXISBANK", "WIPRO", "M&M",
+    "ZOMATO", "DMART", "HAL", "BEL", "TRENT", "COALINDIA", "SIEMENS", "INDIGO"
+]
+
 col1, col2 = st.columns([3, 1])
 
 with col1:
-    selected_ticker = st.selectbox("Select Company:", sorted(ticker_list), index=None, placeholder="Select stock...")
+    selected_ticker = st.selectbox(
+        "Select Company:", 
+        sorted(ticker_list), 
+        index=None, 
+        placeholder="Type to search..."
+    )
 
 with col2:
-    st.write("") 
+    st.write("") # Spacers
     st.write("")
     generate_btn = st.button("🚀 Run Research", type="primary")
 
+# --- 5. EXECUTION LOGIC ---
 if generate_btn:
     if not selected_ticker:
-        st.error("Please select a ticker.")
+        st.error("Please select a ticker from the dropdown.")
     else:
-        # 
-
-[Image of AI Data Pipeline]
-
-        # This pipeline diagram helps visualize the flow: Yahoo Finance -> Tavily -> Gemini LLM -> Report
         with st.spinner(f"📊 Analyzing {selected_ticker}..."):
+            # 1. Fetch Data
             fin_markdown, error = get_financials(selected_ticker)
             news_text = get_news(selected_ticker)
             
             if error:
                 st.error(error)
             else:
-                with st.spinner("✍️ Writing Final Report (Using Gemini 1.5 Flash)..."):
+                # 2. Write Report
+                with st.spinner("✍️ Analyst is writing the report..."):
                     prompt = f"""
                     You are a Senior Analyst. Write a report for **{selected_ticker}**.
                     
@@ -145,11 +169,11 @@ if generate_btn:
                     [NEWS]
                     {news_text}
                     
-                    Output:
-                    1. Business Summary
-                    2. Financial Trend Analysis
-                    3. Risk Flags
-                    4. Investment Verdict (Buy/Sell/Hold)
+                    Output Structure:
+                    1. **Business Summary**: Brief description.
+                    2. **Financial Trend Analysis**: Comment on Revenue and ROE growth.
+                    3. **Risk Analysis**: Any red flags from news?
+                    4. **Investment Verdict**: Buy/Sell/Hold rating with rationale.
                     """
                     
                     report = generate_report_safe(prompt)
@@ -158,5 +182,5 @@ if generate_btn:
                         st.error(report)
                     else:
                         st.markdown("---")
-                        st.subheader(f"📝 Report: {selected_ticker}")
+                        st.subheader(f"📝 Research Report: {selected_ticker}")
                         st.markdown(report)
