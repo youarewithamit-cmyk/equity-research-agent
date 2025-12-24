@@ -3,7 +3,7 @@ import google.generativeai as genai
 from tavily import TavilyClient
 import yfinance as yf
 import pandas as pd
-import tabulate # Needed for markdown
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # --- PAGE CONFIG ---
 st.set_page_config(
@@ -13,30 +13,9 @@ st.set_page_config(
 )
 
 st.title("📈 Agentic Equity Research Assistant")
+st.markdown("Generates a professional Investment Report using **Live Financials** (Yahoo Finance) + **Web Search** (Tavily).")
 
-# --- 1. TICKER LIST (The Dropdown Source) ---
-@st.cache_data # Cache this so it doesn't reload on every click
-def get_nifty500_tickers():
-    # You can replace this list with a full CSV load later!
-    # Common NIFTY 500 Stocks
-    tickers = [
-        "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "ITC", "BHARTIARTL",
-        "SBIN", "LICI", "HINDUNILVR", "TATAMOTORS", "LT", "BAJFINANCE", "HCLTECH",
-        "MARUTI", "SUNPHARMA", "ADANIENT", "TITAN", "KOTAKBANK", "ONGC", "TATASTEEL",
-        "NTPC", "POWERGRID", "ASIANPAINT", "ULTRACEMCO", "AXISBANK", "WIPRO",
-        "BAJAJFINSV", "COALINDIA", "M&M", "ADANIPORTS", "JSWSTEEL", "TATASTEEL",
-        "DMART", "ZOMATO", "JIOFIN", "DLF", "VBL", "HAL", "BEL", "IRFC", "TRENT",
-        "SIEMENS", "INDIGO", "PIDILITIND", "GRASIM", "SBILIFE", "TECHM", "BRITANNIA",
-        "HINDALCO", "GODREJCP", "EICHERMOT", "LTIM", "DRREDDY", "CIPLA", "IOC",
-        "GAIL", "RECLTD", "PFC", "ADANIPOWER", "BANKBARODA", "TATAPOWER", "CHOLAFIN",
-        "AMBUJACEM", "CANBK", "VEDL", "INDUSINDBK", "HAVELLS", "TVSMOTOR", "HEROMOTOCO",
-        "DABUR", "SHREECEM", "MANKIND", "BAJAJ-AUTO", "ABB", "BPCL", "BOSCHLTD",
-        "CUMMINSIND", "DIVISLAB", "MUTHOOTFIN", "PIIND", "PAGEIND", "OFSS", "POLYCAB"
-    ]
-    # Sort alphabetically for easier searching
-    return sorted(tickers)
-
-# --- 2. AUTHENTICATION ---
+# --- 1. AUTHENTICATION ---
 def load_api_keys():
     try:
         g_key = st.secrets["GOOGLE_API_KEY"]
@@ -49,6 +28,7 @@ def load_api_keys():
         st.header("🔐 Authentication")
         g_input = st.text_input("Gemini API Key", type="password")
         t_input = st.text_input("Tavily API Key", type="password")
+        
         if not g_input or not t_input:
             return None, None, "⚠️ Waiting for Keys..."
         return g_input, t_input, "✅ Authenticated via Sidebar"
@@ -64,18 +44,30 @@ else:
 genai.configure(api_key=GOOGLE_API_KEY)
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
-# --- 3. MODEL & DATA ENGINES ---
+# --- 2. ROBUST MODEL SELECTOR (FIXED PRIORITY) ---
 def get_working_model():
     try:
         models = list(genai.list_models())
         valid_models = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-        if not valid_models: return None
-        preferences = ['models/gemini-1.5-flash', 'models/gemini-1.5-pro', 'models/gemini-pro']
+        
+        # PRIORITY FIX: Put the high-quota stable models FIRST
+        # gemini-1.5-flash = 1,500 requests per day (Free Tier)
+        preferences = [
+            'models/gemini-1.5-flash',
+            'models/gemini-1.5-flash-001',
+            'models/gemini-1.5-pro',
+            'models/gemini-pro'
+        ]
+        
         for p in preferences:
-            if p in valid_models: return p
-        return valid_models[0]
-    except: return None
+            if p in valid_models:
+                return p
+        
+        return valid_models[0] # Fallback
+    except:
+        return None
 
+# --- 3. DATA ENGINES ---
 def get_financials(ticker):
     try:
         t = ticker.upper().strip().replace(" ", "")
@@ -108,46 +100,40 @@ def get_financials(ticker):
 
 def get_news(ticker):
     try:
-        # Tavily Search
         results = tavily.search(query=f"{ticker} share news india frauds analysis", max_results=3)
         return "\n".join([f"- {r['title']}: {r['content'][:250]}..." for r in results['results']])
     except: return "News Error"
 
-# --- 4. MAIN UI WITH DROPDOWN ---
+# --- 4. AI WRITER WITH AUTO-RETRY ---
+# This decorator automatically retries if it hits a 429 error
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def generate_content_with_retry(model_name, prompt):
+    model = genai.GenerativeModel(model_name)
+    return model.generate_content(prompt)
 
-# A. Get the list of tickers
-ticker_list = get_nifty500_tickers()
-
-# B. Create a layout for the selector
+# --- 5. MAIN UI ---
+ticker_list = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ITC", "SBIN", "TATAMOTORS", "ZOMATO", "M&M"] 
 col1, col2 = st.columns([3, 1])
 
 with col1:
-    # THE SEARCHABLE DROPDOWN
-    selected_ticker = st.selectbox(
-        "Select a Company (Type to Search):", 
-        ticker_list,
-        index=None,  # Start with nothing selected
-        placeholder="Select stock..."
-    )
+    selected_ticker = st.selectbox("Select Company:", sorted(ticker_list), index=None, placeholder="Select stock...")
 
 with col2:
-    # Just a spacer to align the button
     st.write("") 
     st.write("")
     generate_btn = st.button("🚀 Run Research", type="primary")
 
-# C. Execution Logic
 if generate_btn:
     if not selected_ticker:
-        st.error("Please select a ticker from the dropdown.")
+        st.error("Please select a ticker.")
     else:
         with st.spinner("🔍 Connecting to AI..."):
             model_name = get_working_model()
             
             if not model_name:
-                st.error("❌ API Error: No working Gemini models found.")
+                st.error("❌ API Error: No working models.")
             else:
-                with st.spinner(f"📊 Analyzing {selected_ticker}..."):
+                with st.spinner(f"📊 Analyzing {selected_ticker} using {model_name}..."):
                     fin_markdown, error = get_financials(selected_ticker)
                     news_text = get_news(selected_ticker)
                     
@@ -172,10 +158,11 @@ if generate_btn:
                             """
                             
                             try:
-                                model = genai.GenerativeModel(model_name)
-                                response = model.generate_content(prompt)
+                                # Use the retry function here
+                                response = generate_content_with_retry(model_name, prompt)
                                 st.markdown("---")
                                 st.subheader(f"📝 Report: {selected_ticker}")
                                 st.markdown(response.text)
                             except Exception as e:
-                                st.error(f"AI Error: {e}")
+                                st.error(f"AI Limit Hit: {e}")
+                                st.info("💡 Tip: You hit the free tier limit. Wait 60 seconds and try again.")
