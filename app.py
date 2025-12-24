@@ -4,15 +4,9 @@ from tavily import TavilyClient
 import yfinance as yf
 import pandas as pd
 import time
-import random
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(
-    page_title="AI Equity Researcher",
-    page_icon="📈",
-    layout="wide"
-)
-
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="AI Equity Researcher", page_icon="📈", layout="wide")
 st.title("📈 Agentic Equity Research Assistant")
 
 # --- 1. AUTHENTICATION ---
@@ -21,15 +15,13 @@ def load_api_keys():
         g_key = st.secrets["GOOGLE_API_KEY"]
         t_key = st.secrets["TAVILY_API_KEY"]
         return g_key, t_key, "✅ Authenticated via Secrets"
-    except (FileNotFoundError, KeyError):
-        pass
-
+    except: pass
+    
     with st.sidebar:
         st.header("🔐 Authentication")
         g_input = st.text_input("Gemini API Key", type="password")
         t_input = st.text_input("Tavily API Key", type="password")
-        if not g_input or not t_input:
-            return None, None, "⚠️ Waiting for Keys..."
+        if not g_input or not t_input: return None, None, "⚠️ Waiting for Keys..."
         return g_input, t_input, "✅ Authenticated via Sidebar"
 
 GOOGLE_API_KEY, TAVILY_API_KEY, status_msg = load_api_keys()
@@ -38,33 +30,41 @@ if "✅" in status_msg:
     st.success(status_msg)
 else:
     st.warning(status_msg)
-    st.stop() 
+    st.stop()
 
 genai.configure(api_key=GOOGLE_API_KEY)
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
-# --- 2. CACHED MODEL SELECTOR (Saves Quota) ---
+# --- 2. STRICT MODEL SELECTOR ---
 @st.cache_resource
-def get_working_model_cached():
+def get_high_quota_model():
     """
-    Checks available models ONCE and remembers the result.
-    This prevents hitting the API limit just to check model names.
+    Finds a model with HIGH limits (1.5 Flash).
+    BANS 'gemini-2.5' or experimental models that cause 429 errors.
     """
     try:
         models = list(genai.list_models())
-        valid_models = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
         
-        if not valid_models: return None
+        # 1. Look specifically for the workhorse model (1500 req/day)
+        for m in models:
+            if 'gemini-1.5-flash' in m.name and '2.5' not in m.name:
+                return m.name
         
-        # Priority: Flash (Fastest) -> Pro (Smarter)
-        priority = ['models/gemini-1.5-flash', 'models/gemini-1.5-pro', 'models/gemini-pro']
-        for p in priority:
-            if p in valid_models: return p
-        return valid_models[0]
+        # 2. Fallback to Pro
+        for m in models:
+            if 'gemini-1.5-pro' in m.name:
+                return m.name
+                
+        # 3. Last Resort (Standard Pro)
+        for m in models:
+            if 'gemini-pro' in m.name:
+                return m.name
+                
+        return None
     except: return None
 
-# --- 3. CACHED DATA ENGINES (Saves Time) ---
-@st.cache_data(ttl=3600) # Remember data for 1 hour
+# --- 3. CACHED DATA ENGINES ---
+@st.cache_data(ttl=3600)
 def get_financials(ticker):
     try:
         t = ticker.upper().strip().replace(" ", "")
@@ -94,36 +94,20 @@ def get_news(ticker):
         return "\n".join([f"- {r['title']}: {r['content'][:250]}..." for r in results['results']])
     except: return "News unavailable."
 
-# --- 4. SMART GENERATOR (With Fallback) ---
-def generate_report(model_name, prompt):
-    model = genai.GenerativeModel(model_name)
-    try:
-        return model.generate_content(prompt).text
-    except Exception as e:
-        if "429" in str(e) or "Quota" in str(e):
-            # If Flash fails, try Pro as a backup (sometimes has different quota bucket)
-            try:
-                fallback_model = 'models/gemini-pro'
-                st.warning(f"⚠️ Quota hit on {model_name}. Switching to {fallback_model}...")
-                time.sleep(2)
-                backup = genai.GenerativeModel(fallback_model)
-                return backup.generate_content(prompt).text
-            except:
-                return "❌ DAILY QUOTA EXCEEDED. Please wait 2-3 minutes."
-        return f"Error: {e}"
-
-# --- 5. UI ---
+# --- 4. EXECUTION ---
 ticker_list = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ITC", "SBIN", "TATAMOTORS", "ZOMATO"]
 selected_ticker = st.selectbox("Select Company:", sorted(ticker_list))
 generate_btn = st.button("🚀 Run Research")
 
 if generate_btn:
-    # Use cached model function
-    model_name = get_working_model_cached()
+    # Get the STRICT model
+    model_name = get_high_quota_model()
     
     if not model_name:
-        st.error("❌ API Error: No models found.")
+        st.error("❌ Critical: No stable Gemini models found for this key.")
     else:
+        st.toast(f"Using High-Quota Model: {model_name}") # Show user which model we picked
+        
         with st.spinner(f"📊 Analyzing {selected_ticker}..."):
             fin_data, err = get_financials(selected_ticker)
             news_data = get_news(selected_ticker)
@@ -139,12 +123,14 @@ if generate_btn:
                 Write a 4-section investment report (Summary, Financials, Risks, Verdict).
                 """
                 
-                # Run Generation
-                report = generate_report(model_name, prompt)
-                
-                if "❌" in report:
-                    st.error(report)
-                else:
+                try:
+                    model = genai.GenerativeModel(model_name)
+                    response = model.generate_content(prompt)
                     st.markdown("---")
                     st.subheader(f"📝 Report: {selected_ticker}")
-                    st.markdown(report)
+                    st.markdown(response.text)
+                except Exception as e:
+                    if "429" in str(e):
+                        st.error(f"❌ Your API Key is currently locked by Google. Please wait 5 minutes or use a new key.")
+                    else:
+                        st.error(f"AI Error: {e}")
